@@ -427,6 +427,13 @@ class Worker(DistributedTorchRayActor):
             inference_engine_cfg, inference_world_size=inference_world_size
         )
 
+        # Disk delta sync seeds its base snapshot from the policy checkpoint,
+        # which only the trainer config knows about.
+        from skyrl.backends.skyrl_train.weight_sync import DiskInitInfo
+
+        if isinstance(init_info, DiskInitInfo) and not init_info.model_path:
+            init_info.model_path = self.cfg.policy.model.path
+
         # Create sender on all ranks
         # Strategy implementations may have different logic for different ranks
         tasks = [

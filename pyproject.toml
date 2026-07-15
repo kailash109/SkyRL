@@ -22,6 +22,8 @@ dependencies = [
     "peft==0.18.1",
     "hf_transfer",
     "cloudpathlib>=0.23.0",
+    # Disk-delta weight sync codec (weight_sync/delta_codec.py)
+    "zstandard>=0.22.0",
 ]
 
 [project.optional-dependencies]

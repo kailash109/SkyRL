@@ -707,8 +707,29 @@ class InferenceEngineConfig(BaseConfig):
     backend: str = "vllm"
     """``"vllm"``."""
     weight_sync_backend: str = "nccl"
+    """``"nccl"`` (NCCL broadcast, or CUDA IPC when colocated) or ``"disk"``
+    (delta sync over a shared filesystem; non-colocated only)."""
     weight_transfer_threshold_cuda_ipc_GB: float = 1.0
     """When using ``cuda_ipc``, send weights in batches of this size (GB)."""
+    weight_sync_disk_dir: Optional[str] = None
+    """Shared filesystem directory for ``weight_sync_backend="disk"``: the trainer
+    publishes per-sync weight deltas here and the inference hosts read them.
+    Use a fresh directory per run. Required when the disk backend is selected."""
+    weight_sync_local_ckpt_dir: Optional[str] = None
+    """Host-local directory (e.g. NVMe) where each inference host keeps the full
+    checkpoint copy that deltas are patched into. Default: derived under the
+    system temp dir."""
+    weight_sync_delta_encoding: str = "xor"
+    """Delta encoding for the disk backend: ``"xor"`` (smallest wire, fastest) or
+    ``"overwrite"`` (larger, idempotent to apply)."""
+    weight_sync_delta_checksum: str = "adler32"
+    """Per-tensor integrity checksum for disk delta apply: ``"adler32"`` (stdlib)
+    or ``"xxh3-128"`` (requires ``xxhash``)."""
+    weight_sync_disk_pre_read_hook: Optional[str] = None
+    """Optional ``"module:function"`` the inference workers call (no args) before
+    reading the shared delta directory. Needed for object-store-backed mounts
+    whose writes aren't immediately visible across hosts (e.g. a Modal Volume
+    needing ``reload()``); POSIX shared filesystems (NFS, Lustre) don't need it."""
     tensor_parallel_size: int = 1
     pipeline_parallel_size: int = 1
     expert_parallel_size: int = 1

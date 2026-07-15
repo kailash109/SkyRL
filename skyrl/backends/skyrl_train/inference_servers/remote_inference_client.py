@@ -1216,6 +1216,33 @@ class RemoteInferenceClient(InferenceEngineInterface):
             },
         )
 
+    async def update_weights_disk(
+        self,
+        update_info: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Apply a published disk weight delta via /collective_rpc.
+
+        Calls NewInferenceWorkerWrap.update_weights_disk on all workers:
+        each host patches its local checkpoint from the shared disk_dir and
+        reloads the requested tensors. Used by the disk transfer sender
+        (weight_sync/disk_strategy.py) after publishing a delta version.
+
+        Args:
+            update_info: Dict with keys version (int), names, dtype_names,
+                shapes.
+
+        Returns:
+            Dict mapping server_url to response.
+        """
+        return await self._call_all_servers(
+            "/collective_rpc",
+            {
+                "method": "update_weights_disk",
+                "kwargs": {"update_info": update_info},
+            },
+        )
+
     async def finish_weight_update(self) -> Dict[str, Any]:
         """
         Finish the current chunked weight update via /collective_rpc.

@@ -24,6 +24,8 @@ Usage:
         skyrl.backends.skyrl_train.inference_servers.new_inference_worker_wrap.NewInferenceWorkerWrap
 """
 
+import sys
+
 import torch
 
 from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
@@ -31,6 +33,33 @@ from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
 )
 
 VLLM_NEW_INFERENCE_WORKER_EXTENSION_CLS = f"{__name__}.NewInferenceWorkerWrap"
+
+
+def _register_disk_transfer_engine() -> None:
+    """Register SkyRL's disk WeightTransferEngine with vLLM's factory.
+
+    Lazy registration keyed on the module path, so vLLM only imports the
+    engine when a server is configured with weight-transfer backend "disk".
+    Guarded on vllm already being imported: this module is also imported on
+    the trainer driver (for VLLM_NEW_INFERENCE_WORKER_EXTENSION_CLS), where
+    pulling in vllm at import time is unwanted; in vLLM worker processes,
+    vllm is always in sys.modules before the extension class is resolved.
+    """
+    if "vllm" not in sys.modules:
+        return
+    from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
+
+    try:
+        WeightTransferEngineFactory.register_engine(
+            "disk",
+            "skyrl.backends.skyrl_train.inference_servers.disk_transfer_engine",
+            "DiskWeightTransferEngine",
+        )
+    except ValueError:
+        pass  # already registered (module imported more than once)
+
+
+_register_disk_transfer_engine()
 
 
 class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
@@ -147,6 +176,51 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
             )
 
         from vllm.config import set_current_vllm_config
+
+        typed_update_info = self.weight_transfer_engine.parse_update_info(update_info)
+        model = self.model_runner.model
+
+        with set_current_vllm_config(self.vllm_config), torch.device(self.device):
+            self.weight_transfer_engine.receive_weights(
+                typed_update_info,
+                load_weights=model.load_weights,
+            )
+
+        torch.accelerator.synchronize()
+
+    def update_weights_disk(self, update_info: dict) -> None:
+        """
+        Apply a published disk delta and reload the patched tensors.
+
+        Counterpart of the disk transfer sender (weight_sync/disk_strategy.py):
+        the trainer publishes a delta version to the shared disk_dir and calls
+        this via /collective_rpc. DiskWeightTransferEngine patches the
+        host-local checkpoint in place and streams the requested tensors into
+        model.load_weights.
+
+        Routed through this skyrl wrap (like update_weights_nccl) so the load
+        runs under set_current_vllm_config and the layerwise-reload lifecycle
+        (skyrl_start_weight_update / skyrl_finish_weight_update).
+
+        Args:
+            update_info: Dict with keys:
+                - version: int (target delta version to apply)
+                - names / dtype_names / shapes: tensor metadata to load
+        """
+        if not getattr(self, "_skyrl_weight_update_active", False):
+            raise RuntimeError("skyrl_start_weight_update must be called before update_weights_disk.")
+
+        if self.weight_transfer_engine is None:
+            raise RuntimeError(
+                "Weight transfer not configured. Please set weight_transfer_config to enable weight transfer."
+            )
+
+        from vllm.config import set_current_vllm_config
+
+        # Fall back to this worker's own model path for materializing the
+        # local base checkpoint (the init info may not carry one).
+        update_info = dict(update_info)
+        update_info.setdefault("model_path", self.vllm_config.model_config.model)
 
         typed_update_info = self.weight_transfer_engine.parse_update_info(update_info)
         model = self.model_runner.model
