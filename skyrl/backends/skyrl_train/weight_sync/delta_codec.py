@@ -245,6 +245,8 @@ class DeltaWriter:
         self._bin = open(os.path.join(self._tmp_dir, DELTA_BIN_NAME), "wb")
         self._offset = 0
         self._compressor = zstandard.ZstdCompressor(level=_ZSTD_LEVEL)
+        self.total_raw_nbytes = 0  # uncompressed tensor bytes seen
+        self.total_compressed_nbytes = 0  # zstd frame bytes written
 
     def add_tensor(
         self,
@@ -271,6 +273,8 @@ class DeltaWriter:
             record = overwrite_encode(new_u8, base_bytes, TORCH_DTYPE_NBYTES[dtype])
         frame = self._compressor.compress(record.tobytes())
         self._bin.write(frame)
+        self.total_raw_nbytes += new_u8.nbytes
+        self.total_compressed_nbytes += len(frame)
         self._manifest.tensors.append(
             TensorDeltaMeta(
                 name=name,

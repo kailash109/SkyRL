@@ -317,6 +317,9 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             await cache_reset_task
         torch.cuda.empty_cache()
         torch.distributed.barrier()
+        # Transfer-size metrics for the trainer's logger (None for senders
+        # that don't account bytes, and on non-rank-0 workers).
+        return self._weight_transfer_sender.get_last_sync_stats()
 
     def _set_pad_token_id(self, pad_token_id):
         # NOTE (sumanthrh): self.model -> HFModelWrapper; self.model.model -> AutoModelForCausalLM

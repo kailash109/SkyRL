@@ -569,15 +569,21 @@ class WorkerDispatch:
             )
         )
 
-    def _broadcast_to_inference_engines(self, inference_engine_client, model_id: Optional[str] = None) -> None:
+    def _broadcast_to_inference_engines(
+        self, inference_engine_client, model_id: Optional[str] = None
+    ) -> Optional[Dict[str, float]]:
         """Broadcast policy weights to inference engines. Helper for save_weights_for_sampler.
 
         ``model_id`` is forwarded to the worker so that, on the LoRA path, the
         adapter is saved into a per-tenant subdir of ``lora_sync_path`` and
         registered on vLLM under that name. None preserves single-tenant
         behavior (the legacy ``SKYRL_LORA_ADAPTER_NAME`` path).
+
+        Returns:
+            Transfer-size metrics from the sender (rank 0), when the transfer
+            strategy accounts them (e.g. disk delta sync); None otherwise.
         """
-        ray.get(
+        results = ray.get(
             self._actor_groups["policy"].async_run_ray_method(
                 "pass_through",
                 "broadcast_to_inference_engines",
@@ -586,6 +592,7 @@ class WorkerDispatch:
                 model_id=model_id,
             )
         )
+        return next((r for r in results if r is not None), None)
 
     def _prepare_for_weight_sync(self) -> None:
         """Prepare for weight sync: ensure policy model is on GPU, offload optimizer. Helper for save_weights_for_sampler."""
@@ -603,7 +610,7 @@ class WorkerDispatch:
             return
         self._offload("policy", offload_optimizer=True, offload_model=True)
 
-    async def save_weights_for_sampler(self, model_id: Optional[str] = None) -> None:
+    async def save_weights_for_sampler(self, model_id: Optional[str] = None) -> Optional[Dict[str, float]]:
         """
         Tinker API method to prepare updated parameters for sampling.
 
@@ -611,6 +618,11 @@ class WorkerDispatch:
         provided we ensure the corresponding LoRA adapter is the live one
         before broadcasting, and tell the worker to register the adapter on
         vLLM under ``model_id``.
+
+        Returns:
+            Transfer-size metrics from the sender when the transfer strategy
+            accounts them (e.g. ``weight_sync/delta_mb`` on the disk backend);
+            None otherwise.
         """
         if self._inference_engine_client is None:
             raise RuntimeError(
@@ -623,9 +635,10 @@ class WorkerDispatch:
         # Make the requested adapter live on every worker before broadcasting
         # — otherwise we'd export some other tenant's LoRA weights to vLLM.
         self.ensure_active_adapter("policy", model_id)
+        sync_stats: Optional[Dict[str, float]] = None
         if self.colocate_all:
             await self._inference_engine_client.wake_up(tags=["weights"])
-            self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
+            sync_stats = self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
             self._finish_weight_sync()
             await self._inference_engine_client.wake_up(tags=["kv_cache"])
         else:
@@ -635,14 +648,14 @@ class WorkerDispatch:
                 strategy == "megatron" and self.cfg.trainer.policy.megatron_config.lora_config.merge_lora
             ):
                 # in-place lora case (mostly for multi-tenant training) - no need to pause - can just rely on load_lora_adapter to swap adapter in place
-                self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
+                sync_stats = self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
                 self._finish_weight_sync()
             else:
                 # Non-colocated single tenant: pause generation to prevent in-flight requests from
                 # reading partially-updated weights during the NCCL broadcast.
                 await self._inference_engine_client.pause_generation()
                 try:
-                    self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
+                    sync_stats = self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
                     self._finish_weight_sync()
                 finally:
                     await self._inference_engine_client.resume_generation()
@@ -650,3 +663,4 @@ class WorkerDispatch:
         # Advance the policy version so prefix-cache salting isolates blocks from the previous weights
         # (see `GeneratorConfig.use_cache_salt`).
         self._inference_engine_client.increment_weight_version()
+        return sync_stats

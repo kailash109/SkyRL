@@ -114,6 +114,7 @@ class DiskWeightTransferSender(WeightTransferSender):
         self._inference_client = inference_client
         self._base: Optional[Dict[str, np.ndarray]] = None
         self._next_version: Optional[int] = None
+        self._last_sync_stats: Optional[Dict[str, float]] = None
         # torch dtype name, e.g. "bfloat16"
         self._dtype_name = init_info.model_dtype_str.split(".")[-1]
 
@@ -212,7 +213,18 @@ class DiskWeightTransferSender(WeightTransferSender):
             raise
         vdir = writer.finalize()
         self._next_version = version + 1
-        logger.info(f"Published weight delta v{version} ({len(names)} tensors) to {vdir}")
+        ratio = writer.total_raw_nbytes / max(1, writer.total_compressed_nbytes)
+        self._last_sync_stats = {
+            "weight_sync/version": float(version),
+            "weight_sync/delta_mb": writer.total_compressed_nbytes / 1e6,
+            "weight_sync/raw_mb": writer.total_raw_nbytes / 1e6,
+            "weight_sync/compression_x": ratio,
+        }
+        logger.info(
+            f"Published weight delta v{version} ({len(names)} tensors) to {vdir}: "
+            f"{writer.total_compressed_nbytes / 1e6:.1f} MB vs {writer.total_raw_nbytes / 1e6:.1f} MB raw "
+            f"({ratio:.2f}x compression)"
+        )
 
         # Drive the receive through SkyRL's chunked lifecycle so the load is
         # wrapped with set_current_vllm_config (matches NCCL/IPC paths).
@@ -232,6 +244,10 @@ class DiskWeightTransferSender(WeightTransferSender):
     def teardown(self) -> None:
         """Drop the base snapshot (no process groups to clean up)."""
         self._base = None
+
+    def get_last_sync_stats(self) -> Optional[Dict[str, float]]:
+        """Size/compression metrics for the last published delta (rank 0 only)."""
+        return self._last_sync_stats
 
 
 class DiskTransferStrategy(WeightTransferStrategy):

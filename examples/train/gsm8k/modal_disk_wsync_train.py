@@ -31,15 +31,34 @@ Usage (from the SkyRL repo root):
     # optional: SKYRL_TRAINER_GPU / SKYRL_INFERENCE_GPU (default H200:2 each)
     # optional: SKYRL_WANDB_SECRET to use a different secret name
 
-    # quick smoke: 3 training steps
+    # default: Qwen3.6-27B on H200:8 (trainer) + H200:4 (inference, TP=4)
+    # a full bf16 sync would be ~54 GB; the delta ships a few GB per step
+    modal run examples/train/gsm8k/modal_disk_wsync_train.py
+
+    # quick smoke first: 3 training steps
     modal run examples/train/gsm8k/modal_disk_wsync_train.py --max-steps 3
 
-    # real run: 1 epoch of GSM8K GRPO (~58 steps at batch 128)
-    modal run examples/train/gsm8k/modal_disk_wsync_train.py
+    # Qwen3.6-35B-A3B (MoE; FSDP works but the Megatron recipe in
+    # examples/train/megatron/ is the tuned path for this model)
+    modal run examples/train/gsm8k/modal_disk_wsync_train.py \
+        --model Qwen/Qwen3.6-35B-A3B --tp 4
+
+    # cheap smoke on a small dense model
+    SKYRL_TRAINER_GPU=H200:2 SKYRL_INFERENCE_GPU=H200:2 \
+        modal run examples/train/gsm8k/modal_disk_wsync_train.py \
+        --model Qwen/Qwen2.5-1.5B-Instruct --tp 2 --max-steps 2
 
     # extra config overrides pass straight through to main_base
     modal run examples/train/gsm8k/modal_disk_wsync_train.py \
         --extra-args "trainer.train_batch_size=64 trainer.epochs=2"
+
+    # the inference host keeps a full local checkpoint copy in container
+    # scratch (~54 GB for 27B); if scheduling lands on a disk-tight host, set
+    # SKYRL_INFERENCE_DISK_GB=200 to request explicit ephemeral disk.
+
+The sender logs per-sync compression ("Published weight delta vN: X MB vs
+Y MB raw (Zx)") and the trainer logs `timing/sync_weights` to wandb — those
+two together are the delta-sync scorecard.
 """
 
 from __future__ import annotations
@@ -55,11 +74,46 @@ from typing import Optional
 
 import modal
 
-MODEL_DEFAULT = "Qwen/Qwen2.5-1.5B-Instruct"
-INFERENCE_TP = 2
-TRAINER_GPU = os.environ.get("SKYRL_TRAINER_GPU", "H200:2")
-INFERENCE_GPU = os.environ.get("SKYRL_INFERENCE_GPU", "H200:2")
+MODEL_DEFAULT = "Qwen/Qwen3.6-27B"
+INFERENCE_TP = 4
+TRAINER_GPU = os.environ.get("SKYRL_TRAINER_GPU", "H200:8")
+INFERENCE_GPU = os.environ.get("SKYRL_INFERENCE_GPU", "H200:4")
 TRAINER_NUM_GPUS = int(TRAINER_GPU.split(":")[1]) if ":" in TRAINER_GPU else 1
+
+# Per-model trainer hyperparameters (micro batches sized for H200s at the
+# recommended GPU counts below). GPU counts themselves are fixed at module
+# import, so set them via env vars:
+#
+#   model                      SKYRL_TRAINER_GPU  SKYRL_INFERENCE_GPU  --tp
+#   Qwen/Qwen3.6-27B (default) H200:8 (default)   H200:4 (default)     4
+#   Qwen/Qwen3.6-35B-A3B (MoE) H200:8             H200:4               4
+#   Qwen/Qwen2.5-1.5B-Instruct H200:2             H200:2               2   (cheap smoke)
+#   Qwen/Qwen2.5-7B-Instruct   H200:4             H200:2               2
+#
+# At 27B a full bf16 sync is ~54 GB on the wire; the delta typically ships
+# a few GB — this is where disk-delta sync is clearly worthwhile.
+# NOTE: Qwen3.6-35B-A3B is MoE; this script trains with FSDP, which works but
+# is slower than the Megatron recipe in examples/train/megatron/.
+MODEL_PRESETS = {
+    "35b-a3b": dict(micro_train=1, micro_fwd=2, mini_batch=32),
+    "27b": dict(micro_train=1, micro_fwd=2, mini_batch=32),
+    "14b": dict(micro_train=2, micro_fwd=4, mini_batch=32),
+    "7b": dict(micro_train=4, micro_fwd=8, mini_batch=32),
+    "1.5b": dict(micro_train=8, micro_fwd=16, mini_batch=32),
+}
+
+
+def _preset_for(model: str) -> dict:
+    name = model.lower()
+    for key, preset in MODEL_PRESETS.items():
+        if key in name:
+            return preset
+    return MODEL_PRESETS["1.5b"]
+
+
+# Optional explicit ephemeral disk (GiB) for the inference container — the
+# host-local checkpoint copy needs ~model-size bytes of scratch (54 GB @ 27B).
+INFERENCE_DISK_GB = int(os.environ.get("SKYRL_INFERENCE_DISK_GB", "0"))
 
 VLLM_PORT = 8000
 SHARED_DIR = "/shared"
@@ -141,6 +195,7 @@ with inference_image.imports():
     image=inference_image,
     gpu=INFERENCE_GPU,
     volumes={SHARED_DIR: shared_volume, HF_CACHE: hf_cache},
+    ephemeral_disk=INFERENCE_DISK_GB * 1024 or None,  # MiB; None = default
     timeout=24 * 3600,
 )
 def inference_server(q: modal.Queue, model: str, tp: int) -> None:
@@ -230,6 +285,9 @@ def trainer(
     wandb_entity: Optional[str],
     wandb_project: str,
 ) -> None:
+    preset = _preset_for(model)
+    print(f"[trainer] model={model} preset={preset} trainer_gpus={TRAINER_NUM_GPUS}")
+
     # Local WANDB_API_KEY (forwarded via param) wins over the Modal secret
     # (already injected into os.environ by `secrets=[wandb_secret]`).
     wandb_api_key = wandb_api_key or os.environ.get("WANDB_API_KEY", "")
@@ -290,16 +348,19 @@ def trainer(
         "generator.inference_engine.weight_sync_backend=disk",
         f"generator.inference_engine.weight_sync_disk_dir={disk_dir}",
         f"generator.inference_engine.weight_sync_disk_pre_read_hook={PRE_READ_HOOK}",
-        # Modest batch config for a 2-GPU trainer.
+        # Batch config from the model-size preset (H200-sized micro batches).
         "trainer.epochs=1",
         "trainer.train_batch_size=128",
-        "trainer.policy_mini_batch_size=32",
-        "trainer.micro_forward_batch_size_per_gpu=16",
-        "trainer.micro_train_batch_size_per_gpu=8",
+        f"trainer.policy_mini_batch_size={preset['mini_batch']}",
+        f"trainer.micro_forward_batch_size_per_gpu={preset['micro_fwd']}",
+        f"trainer.micro_train_batch_size_per_gpu={preset['micro_train']}",
         "trainer.max_prompt_length=512",
         "generator.sampling_params.max_generate_length=1024",
         "generator.n_samples_per_prompt=5",
         "generator.batched=true",
+        # Qwen3+ chat templates default to thinking mode; keep GSM8K rollouts
+        # direct-answer. Harmless for templates without the flag (e.g. Qwen2.5).
+        "generator.chat_template_kwargs.enable_thinking=false",
         "environment.env_class=gsm8k",
         "trainer.policy.optimizer_config.lr=1.0e-6",
         "trainer.algorithm.use_kl_loss=true",

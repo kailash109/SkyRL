@@ -57,6 +57,15 @@ class WeightTransferSender(ABC):
         """Clean up resources used by the sender (e.g., destroy process groups)."""
         ...
 
+    def get_last_sync_stats(self) -> Optional[Dict[str, float]]:
+        """Metrics describing the most recent ``send_chunks`` call, or None.
+
+        Senders that can account for transfer size/compression (e.g. the disk
+        delta sender) override this; the stats are surfaced by the trainer as
+        ``weight_sync/*`` metrics. Only meaningful on rank 0.
+        """
+        return None
+
 
 # NOTE (sumanthrh): WeightTransferStrategy is assymetric - only dictates sender send APIs
 # because we rely on the native vLLM WeightTransferEngine for the receive logic.

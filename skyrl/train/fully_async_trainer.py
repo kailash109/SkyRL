@@ -556,7 +556,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
                         # 4. After training: pause generation, sync weights, resume.
                         with Timer("sync_weights", self.all_timings):
-                            await self.dispatch.save_weights_for_sampler()
+                            sync_stats = await self.dispatch.save_weights_for_sampler()
+                        if sync_stats:
+                            # Transfer-size metrics (e.g. weight_sync/delta_mb on
+                            # the disk backend); pairs with timing/sync_weights.
+                            self.all_metrics.update(sync_stats)
 
                     # A training step completed: count it for this epoch's bookkeeping.
                     trained_steps_this_epoch += 1

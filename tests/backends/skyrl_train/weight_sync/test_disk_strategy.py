@@ -179,6 +179,27 @@ async def test_sender_publishes_versions(tmp_path, encoding):
 
 
 @pytest.mark.asyncio
+async def test_sender_reports_sync_stats(tmp_path):
+    """get_last_sync_stats exposes per-sync transfer sizes for trainer metrics."""
+    ckpt_dir = tmp_path / "ckpt"
+    ckpt_dir.mkdir()
+    v0 = _make_model(seed=0)
+    _write_checkpoint(ckpt_dir, v0)
+
+    sender = DiskWeightTransferSender(_init_info(tmp_path), FakeInferenceClient())
+    assert sender.get_last_sync_stats() is None  # nothing synced yet
+
+    await sender.send_chunks(_chunks({n: (t + 0.01).to(t.dtype) for n, t in v0.items()}))
+    stats = sender.get_last_sync_stats()
+    assert stats is not None
+    assert stats["weight_sync/version"] == 1.0
+    raw_nbytes = sum(t.numel() * t.element_size() for t in v0.values())
+    assert stats["weight_sync/raw_mb"] == pytest.approx(raw_nbytes / 1e6)
+    assert 0 < stats["weight_sync/delta_mb"] <= stats["weight_sync/raw_mb"]
+    assert stats["weight_sync/compression_x"] >= 1.0
+
+
+@pytest.mark.asyncio
 async def test_sender_resume_replays_published_versions(tmp_path):
     """A restarted trainer rebuilds its base from disk and continues the chain."""
     ckpt_dir = tmp_path / "ckpt"
