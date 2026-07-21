@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import random
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -69,17 +68,13 @@ class ExternalStitchInferenceClient(ExternalInferenceClientBase):
         version = 0 if base_model else int(weight_version)
         session_id = types.make_routing_session_id(request.sampling_session_id, request.seq_id)
         headers = {"X-Session-Affinity": session_id} if session_id else {}
-        seed = request.sampling_params.seed
-        if seed is None:
-            seed = random.randint(0, 2**31 - 1)
 
-        async def generate(sample_index: int) -> types.GeneratedSequence:
+        async def generate() -> types.GeneratedSequence:
             params: dict[str, Any] = {
                 "max_new_tokens": request.sampling_params.max_tokens,
                 "temperature": request.sampling_params.temperature,
                 "top_p": request.sampling_params.top_p,
                 "top_k": request.sampling_params.top_k,
-                "seed": seed + sample_index,
             }
             stop = request.sampling_params.stop
             if stop and isinstance(stop[0], int):
@@ -112,5 +107,5 @@ class ExternalStitchInferenceClient(ExternalInferenceClientBase):
                 stop_reason="length" if finish_type == "length" else "stop",
             )
 
-        sequences = await asyncio.gather(*(generate(i) for i in range(request.num_samples)))
+        sequences = await asyncio.gather(*(generate() for _ in range(request.num_samples)))
         return types.SampleOutput(sequences=sequences, prompt_logprobs=[])

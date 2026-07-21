@@ -51,6 +51,7 @@ training_image = (
             "PATH": "/root/.local/bin:/usr/local/cuda/bin:${PATH}",
             "HF_HOME": HF_HOME,
             "HF_HUB_ENABLE_HF_TRANSFER": "1",
+            "PYTHONPATH": "/root/stitch/src",
             "UV_LINK_MODE": "copy",
             "UV_PROJECT_ENVIRONMENT": f"{REMOTE_REPO}/.venv",
         }
@@ -168,7 +169,7 @@ def train(rollout_url: str, steps: int = 2) -> None:
             [
                 "uv",
                 "run",
-                "--isolated",
+                "--frozen",
                 "--extra",
                 "tinker",
                 "--extra",
@@ -195,7 +196,7 @@ def train(rollout_url: str, steps: int = 2) -> None:
         [
             "uv",
             "run",
-            "--isolated",
+            "--frozen",
             "--extra",
             "tinker",
             "--extra",
@@ -247,12 +248,13 @@ def train(rollout_url: str, steps: int = 2) -> None:
             [
                 "uv",
                 "run",
-                "--isolated",
+                "--frozen",
                 "--extra",
                 "tinker",
                 "--extra",
                 "fsdp",
-                "examples/tinker/stitch/grpo_client.py",
+                "-m",
+                "examples.tinker.stitch.grpo_client",
                 "--base-url",
                 "http://127.0.0.1:8000",
                 "--model",
@@ -274,12 +276,18 @@ def train(rollout_url: str, steps: int = 2) -> None:
 
 
 def rollout_gateway_url() -> str:
-    from stitch.providers.modal import resolve_flash_gateway_url
-
-    return resolve_flash_gateway_url(APP_NAME, RolloutPool.__name__)
+    urls = RolloutPool._experimental_get_flash_urls()
+    if not urls:
+        raise RuntimeError("RolloutPool has no Flash gateway URL")
+    return str(urls[0]).rstrip("/")
 
 
 @app.local_entrypoint()
-def main(steps: int = 2) -> None:
+def main(steps: int = 2, wait: bool = False) -> None:
     download_model.remote()
-    train.remote(rollout_gateway_url(), steps=steps)
+    rollout_url = rollout_gateway_url()
+    if wait:
+        train.remote(rollout_url, steps=steps)
+    else:
+        train.spawn(rollout_url, steps=steps)
+        print("Submitted detached SkyRL training job")
