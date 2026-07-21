@@ -37,6 +37,7 @@ from skyrl.tinker.db_models import (
     FutureDB,
     ModelDB,
     RequestStatus,
+    SamplerVersionDB,
     SamplingSessionDB,
     SessionDB,
     enable_sqlite_wal,
@@ -44,6 +45,7 @@ from skyrl.tinker.db_models import (
 )
 from skyrl.tinker.extra import (
     ExternalInferenceClient,
+    ExternalStitchInferenceClient,
     SkyRLTrainInferenceForwardingClient,
 )
 from skyrl.utils.log import get_uvicorn_log_config, logger
@@ -119,8 +121,8 @@ async def lifespan(app: FastAPI):
     # Setup external inference client if configured.
     #
     # Three cases:
-    #   1. external_inference_url set: forward sample requests to a fully
-    #      external vLLM (existing behavior).
+    #   1. external_inference_url set: forward sample requests to the configured
+    #      external vLLM or Stitch service.
     #   2. backend in (megatron, fsdp) and colocate_all=False: install
     #      SkyRLTrainInferenceForwardingClient so sample requests go directly
     #      to the SkyRL-Train-managed vLLM, bypassing the engine's serial loop.
@@ -136,7 +138,12 @@ async def lifespan(app: FastAPI):
     # when the operator explicitly sets it to False.
     is_colocated = bool(backend_cfg.get("trainer.placement.colocate_all", True))
     if app.state.engine_config.external_inference_url:
-        app.state.external_inference_client = ExternalInferenceClient(app.state.engine_config, app.state.db_engine)
+        client_cls = (
+            ExternalStitchInferenceClient
+            if app.state.engine_config.external_inference_provider == "stitch"
+            else ExternalInferenceClient
+        )
+        app.state.external_inference_client = client_cls(app.state.engine_config, app.state.db_engine)
         logger.info(f"External engine configured: {app.state.engine_config.external_inference_url}")
     elif backend_name in ("megatron", "fsdp") and not is_colocated:
         app.state.external_inference_client = SkyRLTrainInferenceForwardingClient(
@@ -1091,6 +1098,7 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
 
     base_model, model_path = await get_sampling_model(request, session)
 
+    weight_version = 0 if base_model else None
     if base_model:
         model_id = checkpoint_id = ""
     else:
@@ -1110,7 +1118,14 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
         await get_model(session, model_id)
         # Validate that the checkpoint exists and is ready
         await validate_checkpoint(req, model_id, checkpoint_id, types.CheckpointType.SAMPLER, session)
+        if req.app.state.engine_config.external_inference_provider == "stitch":
+            sampler_version = await session.get(SamplerVersionDB, (model_id, checkpoint_id))
+            if sampler_version is None:
+                raise HTTPException(status_code=500, detail="Sampler checkpoint has no Stitch weight version")
+            weight_version = sampler_version.weight_version
 
+    sampling_params = request.sampling_params.to_types()
+    request.sampling_params.seed = sampling_params.seed
     request_id = await create_future(
         session=session,
         request_type=(
@@ -1120,7 +1135,7 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
         request_data=types.SampleInput(
             base_model=base_model,
             prompt=request.prompt.to_types(),
-            sampling_params=request.sampling_params.to_types(),
+            sampling_params=sampling_params,
             num_samples=request.num_samples,
             checkpoint_id=checkpoint_id,
             prompt_logprobs=request.prompt_logprobs if request.prompt_logprobs is not None else False,
@@ -1134,7 +1149,12 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
     if req.app.state.external_inference_client:
         asyncio.create_task(
             req.app.state.external_inference_client.call_and_store_result(
-                request_id, request, model_id, checkpoint_id, base_model=base_model
+                request_id,
+                request,
+                model_id,
+                checkpoint_id,
+                base_model=base_model,
+                weight_version=weight_version,
             )
         )
 
@@ -1391,6 +1411,10 @@ async def delete_checkpoint(
     # leave an orphaned file (GC-able) rather than a row that lists a checkpoint whose
     # archive is gone, which would make every subsequent download 500.
     path = checkpoint_file_path(request, unique_id, checkpoint_id, resolved_checkpoint_type)
+    if resolved_checkpoint_type == types.CheckpointType.SAMPLER:
+        sampler_version = await session.get(SamplerVersionDB, (unique_id, checkpoint_id))
+        if sampler_version is not None:
+            await session.delete(sampler_version)
     await session.delete(checkpoint_db)
     await session.commit()
     await asyncio.to_thread(delete_checkpoint_file, path)

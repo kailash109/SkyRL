@@ -1228,6 +1228,14 @@ class SkyRLTrainBackend(AbstractBackend):
 
         logger.info(f"Loaded checkpoint for {model_id} from {checkpoint_path}")
 
+    def export_lora_adapter(self, output_dir, model_id: str) -> None:
+        """Export one policy adapter in PEFT format without starting inference."""
+
+        self._validate_model_state(model_id)
+        if self._get_role(model_id) != "policy" or self._base_lora_signature is None:
+            raise ValueError("Stitch sampler export requires a LoRA policy model")
+        self._dispatch.export_lora_adapter("policy", str(output_dir), model_id=model_id)
+
     def save_sampler_checkpoint(self, output_path, model_id: str, persist: bool = True) -> None:
         """Sync weights to colocated inference engines and optionally save to disk.
 

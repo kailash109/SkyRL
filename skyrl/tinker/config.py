@@ -4,9 +4,10 @@ import argparse
 import json
 import os
 from pathlib import Path
+from typing import Literal
 
 from cloudpathlib import AnyPath
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class EngineConfig(BaseModel):
@@ -32,7 +33,12 @@ class EngineConfig(BaseModel):
     )
     external_inference_url: str | None = Field(
         default=None,
-        description="URL of the external inference engine. If set, sample requests will be sent to the external engine instead (currently only VLLM is supported).",
+        description="URL of the external inference engine. If set, sample requests are sent to this service.",
+        json_schema_extra={"argparse_type": str},
+    )
+    external_inference_provider: Literal["vllm", "stitch"] = Field(
+        default="vllm",
+        description="Wire protocol used by the external inference service.",
         json_schema_extra={"argparse_type": str},
     )
     external_inference_api_key: str = Field(
@@ -42,6 +48,34 @@ class EngineConfig(BaseModel):
     external_inference_lora_base: Path = Field(
         default=Path("/tmp/lora_models"),
         description="Directory where LoRA models will be extracted for external inference engines",
+    )
+    stitch_bulletin_root: Path | None = Field(
+        default=None,
+        description="Shared bulletin-board path used to publish Stitch LoRA versions.",
+        json_schema_extra={"argparse_type": Path},
+    )
+    stitch_bulletin_volume: str | None = Field(
+        default=None,
+        description="Modal Volume name backing stitch_bulletin_root.",
+        json_schema_extra={"argparse_type": str},
+    )
+    stitch_request_timeout_s: float = Field(
+        default=600.0,
+        gt=0,
+        description="Timeout for one external Stitch generation request.",
+        json_schema_extra={"argparse_type": float},
+    )
+    stitch_max_retries: int = Field(
+        default=60,
+        ge=1,
+        description="Maximum attempts for retryable Stitch generation responses.",
+        json_schema_extra={"argparse_type": int},
+    )
+    stitch_retry_backoff_s: float = Field(
+        default=1.0,
+        ge=0,
+        description="Delay between retryable Stitch generation attempts.",
+        json_schema_extra={"argparse_type": float},
     )
     forwarding_inference_max_connections: int | None = Field(
         default=None,
@@ -68,6 +102,15 @@ class EngineConfig(BaseModel):
         default=300,
         description="Seconds without heartbeat before session is considered stale. Set to -1 to disable cleanup.",
     )
+
+    @model_validator(mode="after")
+    def validate_external_inference(self):
+        if self.external_inference_provider == "stitch":
+            if self.external_inference_url is None or self.stitch_bulletin_root is None:
+                raise ValueError("Stitch inference requires external_inference_url and stitch_bulletin_root")
+            if self.backend not in ("fsdp", "megatron"):
+                raise ValueError("Stitch inference requires the fsdp or megatron backend")
+        return self
 
 
 def convert_env_var(env_name: str, env_value: str, expected_type: type):

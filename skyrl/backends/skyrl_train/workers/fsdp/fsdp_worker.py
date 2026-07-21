@@ -219,14 +219,9 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             weight_prefix=weight_prefix,
         )
 
-    async def _save_lora_adapters_and_sync(
-        self,
-        peft_model,
-        lora_sync_path,
-        inference_engine_client,
-        lora_name: str = SKYRL_LORA_ADAPTER_NAME,
-    ):
-        """Collect LoRA parameters, save and call inference engine to load."""
+    async def export_lora_adapter(self, output_dir: str) -> None:
+        """Export the active LoRA adapter in PEFT format."""
+
         import json
         from dataclasses import asdict
 
@@ -236,22 +231,32 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             collect_lora_params,
         )
 
+        peft_model = getattr(self.model.model, "_fsdp_wrapped_module", self.model.model)
+        assert hasattr(peft_model, "peft_config"), "LoRA model should have peft_config"
         lora_params = collect_lora_params(module=self.model.model)
 
         if torch.distributed.get_rank() == 0:
-            os.makedirs(lora_sync_path, exist_ok=True)
+            os.makedirs(output_dir, exist_ok=True)
 
             peft_config = asdict(peft_model.peft_config.get("default", {}))
             peft_config["task_type"] = peft_config["task_type"].value
             peft_config["peft_type"] = peft_config["peft_type"].value
             peft_config["target_modules"] = list(peft_config["target_modules"])
 
-            # Save LoRA parameters and config
-            save_file(lora_params, os.path.join(lora_sync_path, "adapter_model.safetensors"))
-            with io.open(os.path.join(lora_sync_path, "adapter_config.json"), "w", encoding="utf-8") as f:
+            save_file(lora_params, os.path.join(output_dir, "adapter_model.safetensors"))
+            with io.open(os.path.join(output_dir, "adapter_config.json"), "w", encoding="utf-8") as f:
                 json.dump(peft_config, f, ensure_ascii=False, indent=4)
 
-            # Send LoRA disk loading request to inference engine.
+    async def _save_lora_adapters_and_sync(
+        self,
+        lora_sync_path,
+        inference_engine_client,
+        lora_name: str = SKYRL_LORA_ADAPTER_NAME,
+    ):
+        """Export the active LoRA adapter and load it into inference."""
+
+        await self.export_lora_adapter(lora_sync_path)
+        if torch.distributed.get_rank() == 0:
             from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
                 RemoteInferenceClient,
             )
@@ -285,21 +290,14 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
 
         torch.cuda.empty_cache()
 
-        # Check if this is a LoRA model
-        peft_model = getattr(self.model.model, "_fsdp_wrapped_module", self.model.model)
-
         if self._is_lora:
-            assert hasattr(peft_model, "peft_config"), "LoRA model should have peft_config"
-
             # Multi-tenant: per-adapter subdir + per-adapter vLLM name.
             # Single-tenant (model_id=None) keeps the legacy shared path +
             # name. _resolve_lora_sync_target (shared with Megatron, defined on
             # PolicyWorkerBase) basename-guards against a malformed model_id
             # escaping lora_sync_path even though api.py already validates IDs.
             lora_name, lora_sync_path = self._resolve_lora_sync_target(model_id)
-            await self._save_lora_adapters_and_sync(
-                peft_model, lora_sync_path, inference_engine_client, lora_name=lora_name
-            )
+            await self._save_lora_adapters_and_sync(lora_sync_path, inference_engine_client, lora_name=lora_name)
         else:
             # Extract and send weights using the sender created at init time.
             # Disable expandable_segments around the send: under colocate_all the

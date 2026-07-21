@@ -10,7 +10,8 @@ SkyRL's implementation of the [Tinker API](https://tinker-docs.thinkingmachines.
 - **`skyrl/tinker/config.py`** -- `EngineConfig` Pydantic model. `add_model()` auto-generates argparse flags from Pydantic fields.
 - **`skyrl/tinker/db_models.py`** -- SQLModel tables: `FutureDB`, `ModelDB`, `CheckpointDB`, `SessionDB`, `SamplingSessionDB`.
 - **`skyrl/tinker/loss_fns.py`** -- JAX loss function implementations (cross_entropy, importance_sampling, ppo, cispo). Only used by the JAX backend.
-- **`skyrl/tinker/extra/`** -- `ExternalInferenceClient` for offloading sampling to external vLLM.
+- **`skyrl/tinker/extra/`** -- API-process clients for external vLLM, external Stitch, and backend-managed vLLM.
+- **`skyrl/tinker/stitch/`** -- Per-run LoRA bulletin board and trainer-side publisher for external Stitch rollout pools.
 - **`skyrl-agent/skyrl_agent/integrations/tinker/`** -- Agent-side Tinker integration (separate package).
 
 ## Starting the Server
@@ -54,12 +55,23 @@ All endpoints are under `/api/v1/`. Requests are async -- submit via POST, get a
 - **Persistent**: `save_weights_for_sampler(name="...")` -- syncs to inference engines AND writes HF checkpoint to disk. Expensive.
 - **Ephemeral**: `save_weights_and_get_sampling_client(name="...")` -- syncs to inference engines only, skips disk write. Triggered when `sampling_session_seq_id` is present in the request.
 - In RL loops, always prefer ephemeral mode; reserve persistent saves for periodic checkpoints.
+- External Stitch mode still writes the PEFT adapter to its bulletin board; it skips only the separate sampler archive.
 - Delete persistent checkpoints after they are no longer needed. The delete endpoint requires an explicit checkpoint type, since a training and a sampler checkpoint can share an id:
   - `DELETE /training_runs/{unique_id}/checkpoints/weights/{checkpoint_id}` (training checkpoint)
   - `DELETE /training_runs/{unique_id}/checkpoints/sampler_weights/{checkpoint_id}` (sampler checkpoint)
   - or `DELETE /training_runs/{unique_id}/checkpoints/{checkpoint_id}?checkpoint_type=training|sampler`
 
   A bare `.../checkpoints/{checkpoint_id}` with no type prefix and no `checkpoint_type` query param is rejected with a `400`. This removes the saved archive from `checkpoints_base`; it does not unload the live model.
+
+## External Stitch Rollouts
+
+Set `external_inference_provider=stitch`, `external_inference_url`, and
+`stitch_bulletin_root` to publish LoRA sampler versions to a Stitch bulletin
+board and route samples to an external SGLang pool. Each Tinker `model_id` has
+an independent version sequence. This path exports the adapter without
+initializing SkyRL-managed inference engines or running push weight sync.
+
+See `examples/tinker/stitch/` for the Modal deployment.
 
 ## Testing
 

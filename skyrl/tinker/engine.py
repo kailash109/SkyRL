@@ -1,6 +1,7 @@
 """Background engine for processing training requests."""
 
 import argparse
+import shutil
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -21,10 +22,13 @@ from skyrl.tinker.db_models import (
     FutureDB,
     ModelDB,
     RequestStatus,
+    SamplerStateDB,
+    SamplerVersionDB,
     SessionDB,
     enable_sqlite_wal,
 )
 from skyrl.utils.log import logger
+from skyrl.utils.storage import pack_and_upload
 
 
 def _model_not_found_error(model_id: str) -> types.ErrorResponse:
@@ -257,6 +261,14 @@ class TinkerEngine:
         backend_class, backend_config_class = get_backend_classes(config.backend, use_ray=use_ray)
         backend_config = backend_config_class(**config.backend_config)
         self.backend = backend_class(config.base_model, backend_config)
+        self.stitch_publisher = None
+        if config.external_inference_provider == "stitch":
+            from skyrl.tinker.stitch import StitchPublisher
+
+            self.stitch_publisher = StitchPublisher(
+                config.stitch_bulletin_root,
+                volume_name=config.stitch_bulletin_volume,
+            )
 
         # Backends that support async sample routing notify us when their
         # inference endpoint changes; we persist it to EngineStateDB so the
@@ -334,6 +346,39 @@ class TinkerEngine:
                         f"model_id={model_id}, checkpoint_id={checkpoint_id}, checkpoint_type={checkpoint_type}"
                     )
                 session.commit()
+
+    def _next_sampler_version(self, model_id: str, checkpoint_id: str) -> int:
+        with Session(self.db_engine) as session:
+            mapping = session.get(SamplerVersionDB, (model_id, checkpoint_id))
+            if mapping is not None:
+                return mapping.weight_version
+            state = session.get(SamplerStateDB, model_id)
+            return 1 if state is None else state.latest_published_version + 1
+
+    def _record_sampler_version(self, model_id: str, checkpoint_id: str, version: int) -> None:
+        with Session(self.db_engine) as session:
+            state = session.get(SamplerStateDB, model_id) or SamplerStateDB(model_id=model_id)
+            state.latest_published_version = max(state.latest_published_version, version)
+            state.updated_at = datetime.now(timezone.utc)
+            mapping = session.get(SamplerVersionDB, (model_id, checkpoint_id)) or SamplerVersionDB(
+                model_id=model_id,
+                checkpoint_id=checkpoint_id,
+                weight_version=version,
+            )
+            mapping.weight_version = version
+            session.add(state)
+            session.add(mapping)
+            session.commit()
+
+    @staticmethod
+    def _archive_sampler_version(source_dir: Path, output_path) -> None:
+        with pack_and_upload(output_path) as archive_dir:
+            for source in source_dir.iterdir():
+                target = archive_dir / source.name
+                if source.is_dir():
+                    shutil.copytree(source, target)
+                else:
+                    shutil.copy2(source, target)
 
     def _find_destructive_barriers(self, session: Session) -> dict[str, int]:
         """Find the earliest pending destructive operation (optim_step/load_weights) per model.
@@ -649,7 +694,17 @@ class TinkerEngine:
         persist = request_data.sampling_session_seq_id is None
 
         with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
-            self.backend.save_sampler_checkpoint(output_path, model_id, persist=persist)
+            if self.stitch_publisher is None:
+                self.backend.save_sampler_checkpoint(output_path, model_id, persist=persist)
+            else:
+                version = self._next_sampler_version(model_id, checkpoint_id)
+                version_dir = self.stitch_publisher.version_dir(model_id, version)
+                if self.stitch_publisher.board.read_latest(model_id) < version:
+                    self.backend.export_lora_adapter(version_dir, model_id)
+                self.stitch_publisher.publish(model_id, version, version_dir)
+                if persist:
+                    self._archive_sampler_version(version_dir, output_path)
+                self._record_sampler_version(model_id, checkpoint_id, version)
             logger.info(f"Saved sampler checkpoint for model {model_id} to {output_path}")
 
         # Return path=None when using sampling_session_seq_id and seq_id (SDK expects this)

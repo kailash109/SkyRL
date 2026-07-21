@@ -507,6 +507,19 @@ class WorkerDispatch:
 
         ray.get(self._actor_groups[model].async_run_ray_method("pass_through", "save_hf_model", export_dir, tokenizer))
 
+    def export_lora_adapter(self, model: str, export_dir: str, model_id: str) -> None:
+        """Export the active LoRA adapter without addressing an inference engine."""
+
+        self._ensure_on_gpu(model, need_optimizer=False, need_model=True)
+        self.ensure_active_adapter(model, model_id)
+        ray.get(
+            self._actor_groups[model].async_run_ray_method(
+                "pass_through",
+                "export_lora_adapter",
+                export_dir,
+            )
+        )
+
     def init_model(self, model: str, model_path: str, num_training_steps: Optional[int] = None) -> None:
         """Initialize model from path. Offloads others in colocation group first."""
         # Offload others in colocation group before init

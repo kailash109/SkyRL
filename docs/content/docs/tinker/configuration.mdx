@@ -73,6 +73,28 @@ Hosting multiple LoRA tenants concurrently against one server *does* require ser
 
 See [Multi-tenancy](./multi_tenancy) for the full operator contract and SFT/RL quickstarts.
 
+## External Stitch rollouts
+
+Tinker can publish LoRA sampler versions to a shared Stitch bulletin board and
+send sampling requests to an independently deployed SGLang rollout pool:
+
+```bash
+uv run --isolated --extra tinker --extra fsdp -m skyrl.tinker.api \
+    --base-model "Qwen/Qwen3-4B-Instruct-2507" \
+    --backend fsdp \
+    --external-inference-provider stitch \
+    --external-inference-url "https://your-rollout-gateway" \
+    --stitch-bulletin-root /bulletin
+```
+
+When the bulletin board is a Modal Volume, also pass
+`--stitch-bulletin-volume <volume-name>` so each publication is committed for
+the rollout replicas to reload.
+
+This mode supports LoRA policy models on the FSDP and Megatron backends. It
+does not start SkyRL-managed vLLM or use NCCL/CUDA-IPC weight synchronization.
+See `examples/tinker/stitch/` for a complete Modal deployment.
+
 ## Full Config Reference
 
 For the complete list of configuration options, see the [SkyRL-Train configuration docs](https://docs.skyrl.ai/docs/configuration/config) and the [`SkyRLTrainConfig` dataclass](https://github.com/NovaSky-AI/SkyRL/blob/main/skyrl/train/config/config.py).

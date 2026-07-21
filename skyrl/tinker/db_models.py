@@ -112,6 +112,27 @@ class CheckpointDB(SQLModel, table=True):
     error_message: str | None = None
 
 
+class SamplerStateDB(SQLModel, table=True):
+    """Latest Stitch sampler publication for one training model."""
+
+    __tablename__ = "sampler_state"
+
+    model_id: str = Field(foreign_key="models.model_id", primary_key=True)
+    latest_published_version: int = 0
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), sa_type=DateTime(timezone=True))
+
+
+class SamplerVersionDB(SQLModel, table=True):
+    """Maps a sampler checkpoint to its immutable Stitch version."""
+
+    __tablename__ = "sampler_versions"
+
+    model_id: str = Field(foreign_key="models.model_id", primary_key=True)
+    checkpoint_id: str = Field(primary_key=True)
+    weight_version: int
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), sa_type=DateTime(timezone=True))
+
+
 class SessionDB(SQLModel, table=True):
     __tablename__ = "sessions"
 

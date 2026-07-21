@@ -86,6 +86,11 @@ Results aggregated → GeneratedSequence objects returned
 
 The `sample()` call is a fairly lightweight wrapper around SkyRL-Train's vLLM inference engines. The backend translates Tinker `SamplingParams` to vLLM format (e.g., `stop_strings` → `stop`, `stop_tokens` → `stop_token_ids`) and delegates prompts to the `RemoteInferenceClient`. `RemoteInferenceClient` forwards the requests to an instance of [vLLM Router](https://github.com/vllm-project/router), which handles load balancing and sticky routing across vLLM workers.
 
+With `external_inference_provider=stitch`, the API process instead uses
+`ExternalStitchInferenceClient`. It sends SGLang `/generate` requests carrying
+the sampler checkpoint's exact per-model weight version and accepts only
+responses stamped with that version by the Stitch sidecar.
+
 
 ## Weight Sync
 
@@ -105,6 +110,10 @@ Training Workers ──→ Inference Engines (vLLM)
     (source weights)     (receive updated weights)
 ```
 
+The external Stitch path replaces this push with a PEFT adapter export into a
+run-partitioned bulletin board. Rollout replicas pull the published version;
+SkyRL does not create or address local inference engines in this mode.
+
 ### Weight Sync Modes: Ephemeral vs Persistent
 
 The Tinker SDK provides two paths for syncing weights to inference engines, depending on whether the caller needs a durable checkpoint on disk.
@@ -116,6 +125,10 @@ Triggered by `save_weights_for_sampler(name="...")`. This syncs the latest train
 #### Ephemeral mode
 
 Triggered by `save_weights_and_get_sampling_client(name="...")`. This syncs weights to the inference engines **only** and skips the disk write entirely. Instead of returning a checkpoint path, it returns a sampling client directly. Use ephemeral mode in hot RL loops where you sync weights every batch but do not need to persist every iteration.
+
+External Stitch rollouts still write the PEFT adapter into the bulletin board
+because pull-based replicas require a durable artifact. They skip only the
+separate user-visible sampler archive.
 
 #### How the server distinguishes them
 

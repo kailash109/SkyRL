@@ -1368,15 +1368,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             training_dtype=torch.bfloat16 if self.cfg.bf16 else torch.float32,
         )
 
-    async def _save_lora_adapters_and_sync(
-        self, lora_sync_path, inference_engine_client, lora_name: str = SKYRL_LORA_ADAPTER_NAME
-    ):
-        """Export LoRA adapter weights via Megatron-Bridge and tell the inference engine to load them.
+    async def export_lora_adapter(self, output_dir: str) -> None:
+        """Export the active LoRA adapter in PEFT format."""
 
-        All ranks participate in the collective export (TP/PP/EP gathering is
-        handled internally by the bridge).  Only rank 0 writes to disk and
-        sends the ``LoraLoadRequest``.
-        """
         import json
 
         from megatron.bridge.models.conversion.peft_bridge import (
@@ -1390,7 +1384,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             adapter_state[f"base_model.model.{name}"] = tensor.clone().float()
 
         if torch.distributed.get_rank() == 0:
-            os.makedirs(lora_sync_path, exist_ok=True)
+            os.makedirs(output_dir, exist_ok=True)
 
             # Rewrite fused-MoE expert LoRA into vLLM's flat PEFT layout so
             # merge_lora=False on-policy sync is accepted (otherwise
@@ -1412,11 +1406,17 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 base_model_name_or_path=base_model_name_or_path,
             )
 
-            save_file(adapter_state, os.path.join(lora_sync_path, "adapter_model.safetensors"))
-            with open(os.path.join(lora_sync_path, "adapter_config.json"), "w", encoding="utf-8") as f:
+            save_file(adapter_state, os.path.join(output_dir, "adapter_model.safetensors"))
+            with open(os.path.join(output_dir, "adapter_config.json"), "w", encoding="utf-8") as f:
                 json.dump(adapter_config, f, ensure_ascii=False, indent=4)
 
-            # Send LoRA disk loading request to inference engine.
+    async def _save_lora_adapters_and_sync(
+        self, lora_sync_path, inference_engine_client, lora_name: str = SKYRL_LORA_ADAPTER_NAME
+    ):
+        """Export the active LoRA adapter and load it into inference."""
+
+        await self.export_lora_adapter(lora_sync_path)
+        if torch.distributed.get_rank() == 0:
             from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
                 RemoteInferenceClient,
             )

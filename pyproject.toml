@@ -41,6 +41,7 @@ tinker = [
     "aiosqlite",
     "asyncpg",
     "psycopg2-binary",
+    "stitch",
 ]
 
 ray = [
@@ -285,6 +286,7 @@ explicit = true
 
 [tool.uv.sources]
 skyrl-gym = { path = "./skyrl-gym", editable = true }
+stitch = { path = "../stitch", editable = true }
 # Match torch's CUDA variant (cu128).
 flashinfer-jit-cache = { index = "flashinfer-cu128", marker = "sys_platform == 'linux'" }
 # vllm 0.23.0's PyPI wheel needs CUDA 13 (libcudart.so.13); the cu129 wheel
