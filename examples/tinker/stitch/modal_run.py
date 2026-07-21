@@ -147,6 +147,7 @@ class RolloutPool:
 @app.function(
     image=training_image,
     gpu="H100:4",
+    secrets=[modal.Secret.from_name("wandb-secret")],
     volumes={
         HF_HOME: hf_volume,
         BULLETIN_ROOT: bulletin_volume,

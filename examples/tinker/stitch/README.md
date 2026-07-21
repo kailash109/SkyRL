@@ -19,6 +19,16 @@ The SkyRL checkout must have the corresponding Stitch checkout at `../stitch`.
 Set `STITCH_LOCAL_DIR` when launching Modal if it lives elsewhere. The rollout
 sidecar requires Stitch's multi-run `run_resolver` support.
 
+Training reads W&B credentials from the `wandb-secret` Modal secret:
+
+```bash
+modal secret create wandb-secret \
+  WANDB_API_KEY=... \
+  WANDB_PROJECT=skyrl-tinker-stitch
+```
+
+`WANDB_ENTITY` and `WANDB_RUN_NAME` may also be stored in the same secret.
+
 The example creates these persistent Modal Volumes:
 
 - `skyrl-tinker-stitch-bulletin`

@@ -41,6 +41,27 @@ def group_advantages(rewards: list[float]) -> list[float]:
     return [(reward - mean) / scale for reward in rewards]
 
 
+def init_wandb(args: argparse.Namespace):
+    if not os.environ.get("WANDB_API_KEY"):
+        return None
+    import wandb
+
+    return wandb.init(
+        project=os.environ.get("WANDB_PROJECT", "skyrl-tinker-stitch"),
+        entity=os.environ.get("WANDB_ENTITY"),
+        name=os.environ.get("WANDB_RUN_NAME"),
+        config={
+            "model": args.model,
+            "steps": args.steps,
+            "prompts_per_step": args.prompts_per_step,
+            "samples_per_prompt": args.samples_per_prompt,
+            "max_tokens": args.max_tokens,
+            "lora_rank": args.lora_rank,
+            "learning_rate": args.learning_rate,
+        },
+    )
+
+
 def main() -> None:
     args = parse_args()
     service = tinker.ServiceClient(base_url=args.base_url, api_key=args.api_key)
@@ -53,6 +74,7 @@ def main() -> None:
     )
     tokenizer = policy.get_tokenizer()
     records = load_split(args.data, tokenizer, max_prompt_length=512)
+    wandb_run = init_wandb(args)
 
     try:
         for step in range(args.steps):
@@ -100,14 +122,27 @@ def main() -> None:
                 {"clip_low_threshold": 0.8, "clip_high_threshold": 1.2},
             ).result()
             result = policy.optim_step(types.AdamParams(learning_rate=args.learning_rate)).result()
+            reward = sum(rewards) / len(rewards)
+            metrics = result.metrics or {}
             logger.info(
                 "step=%s reward=%.3f trajectories=%s metrics=%s",
                 step + 1,
-                sum(rewards) / len(rewards),
+                reward,
                 len(datums),
-                result.metrics,
+                metrics,
             )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "train/reward": reward,
+                        "train/trajectories": len(datums),
+                        **metrics,
+                    },
+                    step=step + 1,
+                )
     finally:
+        if wandb_run is not None:
+            wandb_run.finish()
         service.holder.close()
 
 
